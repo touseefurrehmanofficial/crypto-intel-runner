@@ -1,0 +1,76 @@
+name: run
+
+# Keeps the private bot (crypto-intel-bot) running around the clock.
+# One run works for up to ~5h40m, then starts its successor; it also hands over within about a minute when
+# new code is pushed to the private repo's main branch. The schedule only restarts the chain if it ever breaks.
+# Nothing private is stored here: the code is fetched with a read/write deploy key held in this repo's Secrets,
+# and the job log shows only start/stop lines (details are kept in the private repo's bot-state branch).
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write              # monthly keep-alive commit (GitHub pauses schedules after 60 quiet days)
+  actions: write               # lets a run start its successor
+
+concurrency:
+  group: intel-bot             # never two bots at once (Telegram allows only one listener)
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+      - name: Get the bot code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.BOT_REPO || 'touseefurrehmanofficial/crypto-intel-bot' }}
+          ssh-key: ${{ secrets.BOT_DEPLOY_KEY }}
+          ref: main
+          path: bot
+      - name: Get the saved state
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.BOT_REPO || 'touseefurrehmanofficial/crypto-intel-bot' }}
+          ssh-key: ${{ secrets.BOT_DEPLOY_KEY }}
+          ref: bot-state
+          path: state
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet -r bot/requirements.txt
+      - name: Run the bot
+        working-directory: bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          COINGLASS_API_KEY: ${{ secrets.COINGLASS_API_KEY }}
+          BLS_API_KEY: ${{ secrets.BLS_API_KEY }}
+          STATE_DIR: ${{ github.workspace }}/state
+          BOT_REPO_DIR: ${{ github.workspace }}/bot
+          RUN_SECONDS: "20400"
+          LOG_QUIET: "1"
+        run: |
+          git -C ../state config user.name "intel-bot"
+          git -C ../state config user.email "intel-bot@users.noreply.github.com"
+          BOT_VERSION=$(git rev-parse HEAD) python -m intelbot run
+      - name: Start the next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run run.yml --repo "$GITHUB_REPOSITORY" --ref main
+      - name: Keep the schedule alive
+        if: always()
+        working-directory: runner
+        run: |
+          if [ $(( $(date +%s) - $(git log -1 --format=%ct) )) -gt 2592000 ]; then
+            date -u +%Y-%m-%dT%H:%MZ > keepalive.txt
+            git config user.name "intel-bot"; git config user.email "intel-bot@users.noreply.github.com"
+            git add keepalive.txt && git commit -q -m "keep-alive" && git push -q
+          fi
